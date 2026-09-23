@@ -1,0 +1,367 @@
+---
+description: Hyperliquid engine guidance — SDK, wallet setup, order types, and recipes for this perpetual futures strategy
+alwaysApply: true
+---
+
+# Hyperliquid on TradingHost
+
+You are helping a user build a perpetual futures trading bot on Hyperliquid. This file covers Hyperliquid-specific knowledge — the SDK, wallet setup, order types, and recipes. See `tradinghost.mdc` for platform conventions (deployment, env vars, logging, persistence, config).
+
+## Engine Overview
+
+Hyperliquid is an on-chain order book DEX for perpetual futures built on its own L1 blockchain. It is the fastest-growing derivatives DEX by volume — fully on-chain, no KYC, sub-second execution, and transparent order book matching. All settlement happens on-chain.
+
+Key capabilities:
+- Perpetual futures with up to 50x leverage
+- On-chain limit/market orders with sub-second fills
+- Funding rates settled every 1 hour
+- Cross-margin and isolated-margin modes
+- Vault system for copy trading and fund management
+- Full programmatic access via Python SDK
+- Testnet with identical API surface
+
+The `hyperliquid-python-sdk` provides two main classes:
+- `Info` — read-only market data and account queries (no auth required for public data)
+- `Exchange` — authenticated trading actions (requires private key)
+
+Limitations:
+- Only perpetual futures — no spot trading (Hyperliquid spot is a separate product with different API patterns)
+- All prices and sizes must conform to the asset's `szDecimals` — the SDK does NOT auto-round
+- Rate limits: 1200 requests per minute per IP. WebSocket subscriptions are separate.
+- Order IDs are assigned by the L1 — you cannot pre-assign them
+- No native stop-loss/take-profit order types — implement in your strategy logic
+
+## Wallet Setup
+
+Hyperliquid uses Ethereum-compatible wallets. You sign transactions with a standard Ethereum private key.
+
+### CRITICAL: Use a Dedicated Wallet
+
+**Never use your main Ethereum wallet.** Create a fresh wallet specifically for Hyperliquid trading:
+
+1. Generate a new Ethereum wallet (MetaMask, `eth_account.create()`, or any wallet tool)
+2. Export the private key (64-character hex string, with or without `0x` prefix)
+3. Store it as the `HYPERLIQUID_PRIVATE_KEY` strategy secret (an environment variable) — never in `config.json` or source. See `tradinghost.mdc` → "Secrets & Credentials".
+
+### Funding Your Wallet
+
+**Mainnet:**
+1. Bridge USDC to Arbitrum (if not already on Arbitrum)
+2. Go to https://app.hyperliquid.xyz and deposit USDC from your Arbitrum wallet
+3. Hyperliquid holds funds in its L1 bridge contract — withdrawals go back through Arbitrum
+
+**Testnet:**
+1. Go to https://app.hyperliquid-testnet.xyz
+2. Connect any wallet to get free testnet funds
+3. Testnet keys are separate from mainnet — use a different key or the same one (testnet has no real value)
+
+### Connection Code
+
+```python
+import json, os, eth_account
+from hyperliquid.info import Info
+from hyperliquid.exchange import Exchange
+from hyperliquid.utils import constants
+
+DATA_DIR = os.environ.get('TRADINGHOST_DATA_DIR', '/data')
+
+with open(os.path.join(DATA_DIR, 'config.json')) as f:
+    config = json.load(f)
+
+base_url = constants.TESTNET_API_URL if config.get('testnet') else constants.MAINNET_API_URL
+
+info = Info(base_url, skip_ws=True)
+account = eth_account.Account.from_key(os.environ['HYPERLIQUID_PRIVATE_KEY'])
+exchange = Exchange(account, base_url)
+```
+
+The `skip_ws=True` parameter on `Info` prevents the SDK from opening a WebSocket on construction — you can subscribe explicitly later if needed.
+
+The coins to trade come from `config['symbols']` (a list, e.g. `["BTC"]`); iterate over it in your strategy loop. The recipes below use `'BTC'` as a concrete example — substitute your configured coins.
+
+### Wallet Address
+
+The SDK derives the wallet address from the private key automatically. To get it:
+
+```python
+address = account.address
+```
+
+This address is used in all `info` queries that require a user address (positions, balances, order status).
+
+## Shutdown Considerations
+
+On Hyperliquid, **always cancel open orders on shutdown** — orphaned resting orders will continue to fill after your bot stops. In your SIGTERM handler's cleanup path:
+
+```python
+open_orders = info.open_orders(address)
+for order in open_orders:
+    exchange.cancel(order['coin'], order['oid'])
+```
+
+## Suggestions
+
+### Market Making Patterns
+
+Hyperliquid is well-suited for market making due to its on-chain order book and low fees:
+- Place symmetric bid/ask orders around mid price
+- Refresh quotes when price moves beyond a threshold
+- Track inventory (net position) and skew quotes to reduce exposure
+- Use `exchange.bulk_orders()` to place/cancel multiple orders atomically
+- Monitor funding rate — being long when funding is deeply negative (or short when positive) costs money
+
+### Funding Rate Arbitrage
+
+Hyperliquid funding rates settle every 1 hour. When funding diverges from other venues:
+- Check `info.funding_history(coin)` for recent rates
+- Compare with centralized exchange funding (Binance, Bybit)
+- Earn funding by taking the receiving side while hedging on another exchange
+- Monitor the `predicted` funding rate via `info.meta()` to anticipate rate changes
+
+## Recipes
+
+### Place a Limit Order
+
+```python
+result = exchange.order(
+    coin='BTC',
+    is_buy=True,
+    sz=0.001,       # size in base asset
+    limit_px=60000,  # limit price
+    order_type={'limit': {'tif': 'Gtc'}},  # Good-til-cancelled
+)
+if result['status'] == 'ok':
+    oid = result['response']['data']['statuses'][0]['resting']['oid']
+    log('info', 'Limit order placed', oid=oid)
+```
+
+Order types for `tif`: `'Gtc'` (good-til-cancelled), `'Ioc'` (immediate-or-cancel), `'Alo'` (add-liquidity-only / post-only).
+
+### Place a Market Order
+
+```python
+result = exchange.order(
+    coin='BTC',
+    is_buy=True,
+    sz=0.001,
+    limit_px=None,
+    order_type={'limit': {'tif': 'Ioc'}},
+)
+```
+
+For market orders, use `Ioc` with a generous `limit_px` (or `None` for market) to ensure a fill. The SDK's `market_open` helper simplifies this:
+
+```python
+result = exchange.market_open(coin='BTC', is_buy=True, sz=0.001)
+```
+
+### Cancel an Order
+
+```python
+result = exchange.cancel(coin='BTC', oid=order_id)
+```
+
+### Cancel All Orders for a Symbol
+
+```python
+open_orders = info.open_orders(address)
+for order in open_orders:
+    if order['coin'] == 'BTC':
+        exchange.cancel('BTC', order['oid'])
+```
+
+### Bulk Order Placement
+
+Place multiple orders atomically:
+
+```python
+from hyperliquid.utils.types import OrderRequest
+
+orders = [
+    OrderRequest(coin='BTC', is_buy=True, sz=0.001, limit_px=59000,
+                 order_type={'limit': {'tif': 'Gtc'}}),
+    OrderRequest(coin='BTC', is_buy=False, sz=0.001, limit_px=61000,
+                 order_type={'limit': {'tif': 'Gtc'}}),
+]
+result = exchange.bulk_orders(orders)
+```
+
+### Get Current Position
+
+```python
+user_state = info.user_state(address)
+positions = user_state['assetPositions']
+
+for pos in positions:
+    p = pos['position']
+    log('info', 'Position',
+        coin=p['coin'],
+        size=float(p['szi']),        # signed size (negative = short)
+        entry_px=float(p['entryPx']),
+        unrealized_pnl=float(p['unrealizedPnl']),
+        liquidation_px=p.get('liquidationPx'),
+    )
+```
+
+### Set Leverage
+
+```python
+exchange.update_leverage(leverage=10, coin='BTC', is_cross=True)
+```
+
+`is_cross=True` for cross-margin, `False` for isolated. Set leverage BEFORE placing orders.
+
+### Close a Position
+
+```python
+result = exchange.market_close(coin='BTC')
+```
+
+Or manually place an opposing order for the exact position size:
+
+```python
+user_state = info.user_state(address)
+for pos in user_state['assetPositions']:
+    p = pos['position']
+    if p['coin'] == 'BTC':
+        sz = abs(float(p['szi']))
+        is_long = float(p['szi']) > 0
+        exchange.order(
+            coin='BTC',
+            is_buy=not is_long,
+            sz=sz,
+            limit_px=None,
+            order_type={'limit': {'tif': 'Ioc'}},
+            reduce_only=True,
+        )
+```
+
+### Market Making (Symmetric Quoting)
+
+```python
+import time
+
+SPREAD_BPS = 10  # 10 basis points each side
+REFRESH_THRESHOLD = 0.002  # refresh if mid moves 0.2%
+SIZE = 0.001
+
+last_mid = None
+
+while running:
+    # Get mid price
+    ticker = info.all_mids()
+    mid = float(ticker['BTC'])
+
+    if last_mid and abs(mid - last_mid) / last_mid < REFRESH_THRESHOLD:
+        time.sleep(1)
+        continue
+
+    # Cancel existing orders
+    for order in info.open_orders(address):
+        if order['coin'] == 'BTC':
+            exchange.cancel('BTC', order['oid'])
+
+    # Place new quotes
+    bid = round(mid * (1 - SPREAD_BPS / 10000), 1)
+    ask = round(mid * (1 + SPREAD_BPS / 10000), 1)
+
+    exchange.order('BTC', True, SIZE, bid, {'limit': {'tif': 'Alo'}})
+    exchange.order('BTC', False, SIZE, ask, {'limit': {'tif': 'Alo'}})
+
+    last_mid = mid
+    log('info', 'Quotes refreshed', bid=bid, ask=ask, mid=mid)
+    time.sleep(5)
+```
+
+### Funding Rate Harvesting
+
+```python
+meta = info.meta()
+for asset in meta['universe']:
+    funding = float(asset.get('funding', 0))
+    if abs(funding) > 0.0005:  # > 5 bps per hour
+        log('info', 'High funding rate',
+            coin=asset['name'],
+            funding_rate=funding,
+            annualized=funding * 24 * 365 * 100,
+        )
+```
+
+### Monitor Liquidation Price
+
+```python
+user_state = info.user_state(address)
+for pos in user_state['assetPositions']:
+    p = pos['position']
+    liq_px = p.get('liquidationPx')
+    entry_px = float(p['entryPx'])
+    if liq_px:
+        distance_pct = abs(float(liq_px) - entry_px) / entry_px * 100
+        log('info', 'Liquidation distance',
+            coin=p['coin'],
+            entry=entry_px,
+            liquidation=float(liq_px),
+            distance_pct=round(distance_pct, 2),
+        )
+```
+
+### Get Account Summary
+
+```python
+user_state = info.user_state(address)
+margin = user_state['marginSummary']
+log('info', 'Account summary',
+    account_value=margin['accountValue'],
+    total_margin_used=margin['totalMarginUsed'],
+    total_raw_usd=margin['totalRawUsd'],
+)
+```
+
+### WebSocket for Real-Time Prices
+
+```python
+from hyperliquid.info import Info
+
+info_ws = Info(base_url, skip_ws=False)
+
+def on_trades(data):
+    for trade in data['data']:
+        log('debug', 'Trade', coin=trade['coin'], px=trade['px'], sz=trade['sz'])
+
+info_ws.subscribe({'type': 'trades', 'coin': 'BTC'}, on_trades)
+```
+
+## Risk Management
+
+Always advise the user on risk:
+
+- **Max position size** — set a hard cap in config. Never exceed it regardless of signals. Hyperliquid positions can be liquidated — unlike spot, you can lose more than your entry.
+- **Liquidation awareness** — always check `liquidationPx` on your positions. If price approaches liquidation, reduce position size or add margin. Cross-margin shares equity across positions (one liquidation can cascade).
+- **Funding rate exposure** — funding settles every 1 hour. Being on the paying side of a high funding rate burns capital quickly. Always check the current and predicted rates.
+- **Private key security** — never log the private key, never hardcode it, always read it from the `HYPERLIQUID_PRIVATE_KEY` environment variable (a TradingHost strategy secret, encrypted at rest). If compromised, all funds can be drained instantly. Consider using a sub-account or vault for additional isolation.
+- **Slippage on market orders** — use `Ioc` limit orders with a max price instead of unbounded market orders for large sizes. The order book can be thin on volatile moves.
+- **Start small** — use testnet first. Then mainnet with minimum size. Scale up only after confirming the bot behaves correctly across market conditions.
+- **Kill switch** — if total loss exceeds a threshold, cancel all orders and flatten all positions immediately.
+- **Network reliability** — Hyperliquid API can have latency spikes. Wrap all exchange calls in retry logic with exponential backoff. Always verify order status after placement.
+
+## Testing
+
+### Testnet Workflow
+
+1. Set `testnet: true` in `config.json`
+2. Get testnet funds from https://app.hyperliquid-testnet.xyz
+3. Use a dedicated key for testnet (or reuse — testnet has no real value)
+4. Deploy to TradingHost — the bot trades on testnet with fake money
+5. Verify: orders execute, positions track correctly, shutdown cancels orders, state persists across restarts
+6. When satisfied, set `testnet: false`, fund your mainnet wallet, and redeploy
+
+### What to Verify Before Going Live
+
+- Bot starts cleanly after a restart (state reconciliation works)
+- SIGTERM produces clean shutdown (all orders cancelled, no orphaned resting orders)
+- Liquidation distance is monitored and acted on
+- Logging captures all trades with enough detail to audit
+- Position sizes never exceed configured maximums
+- The strategy handles API errors gracefully (retries, doesn't double-submit)
+- Funding rate impact is accounted for in PnL calculations
+- SQLite state matches Hyperliquid state after every operation
